@@ -146,9 +146,98 @@ _BOARD_SPECS = [
     )),
 ]
 
+_LEDGER_SPECS = [
+    _cmd("adopt-legacy", help="Adopt every existing kanban task into the work ledger"),
+    _cmd("ingest-source", [
+        _arg("source", help="Source system name"),
+        _arg("event_id", help="Immutable event id in that source"),
+        _arg("event_type", help="Source event type"),
+        _arg("--account", help="Source account or mailbox"),
+        _arg("--occurred-at", type=int, help="Source event time as Unix seconds"),
+        _arg("--raw-ref", help="Stable reference back to the source record"),
+        _arg("--payload-sha256", help="SHA256 digest of the source payload; raw content is not stored"),
+        _arg("--task-id", help="Link the event to an existing task"),
+        _arg("--create-title", help="Create a task atomically with this title"),
+        _arg("--create-body", help="Body for the atomically created task"),
+        _arg("--assignee", help="Assignee for the atomically created task"),
+        _arg("--created-by", help="Creator label for the atomically created task"),
+        _arg("--ignored-reason", help="Record why this event does not create work"),
+    ], help="Ingest one immutable source event exactly once"),
+    _cmd("advance-cursor", [
+        _arg("source"), _arg("cursor"),
+        _arg("--previous-cursor", help="Exact cursor observed before this read; omit only for first write"),
+        _arg("--account"), _arg("--stream", default="default"),
+        _arg("--last-event-at", type=int),
+        _arg("--backlog", type=int, default=0),
+        _arg("--freshness-sla", type=int, help="Maximum healthy cursor age in seconds"),
+    ], help="Advance a source cursor using compare-and-set"),
+    _cmd("sync-projection", [
+        _arg("system"), _arg("external_id"), _TASK_ID,
+        _arg("--state-json", help="Observed external state as JSON; only its digest is stored"),
+    ], help="Bind or refresh an external projection of one task"),
+    _cmd("set-spec", [
+        _TASK_ID, _arg("objective"), _arg("expected_result"),
+        _arg("--deadline-at", type=int, help="Deadline as Unix seconds"),
+        _arg("--safety-margin", type=int, default=0, help="Seconds before deadline reserved for safety"),
+        _arg("--urgency", choices=("low", "normal", "high", "critical"), default="normal"),
+        _arg("--risk-class", default="normal"),
+        _arg("--value-score", type=float, default=0, help="Outcome value from 0 to 100"),
+        _arg("--expected-revision", type=int, help="Required compare-and-set revision for updates"),
+    ], help="Set the outcome, deadline, value, and risk contract"),
+    _cmd("open-decision", [
+        _arg("decision_id"), _TASK_ID, _arg("question"), _arg("--source-ref"),
+    ], help="Open one question with one identity across channels"),
+    _cmd("answer-decision", [
+        _arg("decision_id"), _arg("answer"), _arg("--actor", required=True),
+        _arg("--action-ref", help="Task, artifact, or external action created from the answer"),
+        _arg("--no-action-reason", help="Why this answer requires no follow-up action"),
+        _arg("--source-ref"),
+    ], help="Answer a decision and close its action semantics"),
+    _cmd("cancel-decision", [
+        _arg("decision_id"), _arg("reason"), _arg("--actor", required=True),
+    ], help="Cancel an obsolete decision with an audit reason"),
+    _cmd("require-acceptance", [
+        _TASK_ID, _arg("requirement_key"), _arg("description"),
+        _arg("--expected-reviewer"),
+        _arg("--optional", action="store_true", help="Do not block completion on this requirement"),
+    ], help="Declare an explicit completion requirement"),
+    _cmd("record-acceptance", [
+        _TASK_ID, _arg("requirement_key"),
+        _arg("status", choices=("passed", "failed", "waived")),
+        _arg("--verified-by", required=True),
+        _arg("--evidence-json", required=True, help="Structured evidence JSON object"),
+        _arg("--artifact", help="Artifact path to fingerprint"),
+    ], help="Record independent acceptance evidence"),
+    _cmd("set-owner", [
+        _arg("scope"), _arg("owner"),
+        _arg("--lease-seconds", type=int, required=True),
+        _arg("--backup-owner"),
+        _arg("--policy-json", help="Owner policy as a JSON object"),
+        _arg("--expected-generation", type=int, help="Required for an explicit live transfer"),
+    ], help="Create, renew, or explicitly transfer an owner lease"),
+    _cmd("heartbeat-owner", [
+        _arg("scope"), _arg("owner"), _arg("--lease-seconds", type=int, required=True),
+    ], help="Renew an owner lease when ownership still matches"),
+    _cmd("bind-owner", [
+        _TASK_ID, _arg("scope"),
+    ], help="Bind task admission to a registered owner scope"),
+    _cmd("owners", help="List owner leases and liveness"),
+    _cmd("record-feedback", [
+        _arg("feedback_id"), _arg("outcome"), _arg("--task-id"),
+        _arg("--channel"), _arg("--category"),
+        _arg("--correction-sha256", help="Digest of the user's edited result; raw text is not stored"),
+        _arg("--metadata-json", help="Safe structured feedback metadata as a JSON object"),
+    ], help="Record acted, dismissed, edited, rewritten, or other outcome feedback"),
+    _cmd("show", [_TASK_ID], help="Show one task's cross-system ledger state"),
+    _cmd("metrics", help="Show outcome and source health metrics"),
+    _cmd("audit", help="Find source, projection, decision, closure, and owner drift"),
+]
+
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
 _SPECS = [
     _cmd("init", help="Create kanban.db if missing (idempotent)"),
+    _cmd("ledger", children=("ledger_action", _LEDGER_SPECS),
+         help="Canonical source, decision, projection, and acceptance ledger"),
     _cmd("boards", children=("boards_action", _BOARD_SPECS),
          help="Manage kanban boards (one board per project / workstream)",
          description=(
@@ -322,6 +411,11 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--responsible", help="Person, team, provider, or system responsible for unblocking"),
+        _arg("--unblock-condition", help="Exact condition that makes the task runnable again"),
+        _arg("--next-check-at", type=int, help="Next check time as Unix seconds"),
+        _arg("--escalate-at", type=int, help="Escalation time as Unix seconds"),
+        _arg("--affected-ref", help="Affected artifact, integration, or dependency reference"),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
@@ -330,6 +424,8 @@ _SPECS = [
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _arg("--answered", action="store_true",
+             help="The reason is Aiman's answer; record it and reset the question-loop counter."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [

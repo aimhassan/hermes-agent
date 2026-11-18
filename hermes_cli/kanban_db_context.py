@@ -25,6 +25,7 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
+_CTX_MAX_LEDGER_ROWS    = 20
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -124,6 +125,86 @@ def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
         size_str = f", {size_kb} KB" if size_kb else ""
         ctype = f", {att.content_type}" if att.content_type else ""
         lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+    lines.append("")
+
+
+def _ctx_work_ledger(lines: list[str], conn: sqlite3.Connection, task_id: str) -> None:
+    """Bounded source identity and acceptance facts for implementers and reviewers."""
+    spec = conn.execute("SELECT * FROM work_specs WHERE task_id=?", (task_id,)).fetchone()
+    sources = conn.execute(
+        "SELECT source, account, event_id, event_type, occurred_at, raw_ref, payload_sha256 "
+        "FROM work_source_events WHERE task_id=? ORDER BY ingested_at DESC LIMIT ?",
+        (task_id, _CTX_MAX_LEDGER_ROWS),
+    ).fetchall()
+    projections = conn.execute(
+        "SELECT system, external_id, state_hash, last_synced_at FROM work_projections "
+        "WHERE task_id=? ORDER BY system, external_id LIMIT ?",
+        (task_id, _CTX_MAX_LEDGER_ROWS),
+    ).fetchall()
+    decisions = conn.execute(
+        "SELECT id, question, status, answer, action_ref, no_action_reason, source_ref "
+        "FROM work_decisions WHERE task_id=? ORDER BY created_at, id LIMIT ?",
+        (task_id, _CTX_MAX_LEDGER_ROWS),
+    ).fetchall()
+    acceptance = conn.execute(
+        "SELECT requirement_key, description, required, expected_reviewer, status, evidence, "
+        "artifact_sha256, verified_by FROM work_acceptance_requirements "
+        "WHERE task_id=? ORDER BY created_at, requirement_key LIMIT ?",
+        (task_id, _CTX_MAX_LEDGER_ROWS),
+    ).fetchall()
+    if not any((spec, sources, projections, decisions, acceptance)):
+        return
+
+    lines.append("## Work ledger and acceptance contract")
+    lines.append(
+        "Use these original source identities and explicit checks when verifying the result. "
+        "A process report is not evidence that the requested outcome exists."
+    )
+    if spec:
+        lines.append("### Outcome contract")
+        lines.append(f"- Objective: {_ctx_cap(spec['objective'])}")
+        lines.append(f"- Expected result: {_ctx_cap(spec['expected_result'])}")
+        lines.append(
+            f"- Deadline: {spec['deadline_at'] or '(none)'}; "
+            f"safety margin: {spec['safety_margin_seconds']}s; urgency: {spec['urgency']}; "
+            f"risk: {spec['risk_class']}; value: {spec['value_score']}"
+        )
+    if sources:
+        lines.append("### Source events")
+        for row in sources:
+            account = f"/{row['account']}" if row["account"] else ""
+            ref = f"; ref={row['raw_ref']}" if row["raw_ref"] else ""
+            digest = f"; sha256={row['payload_sha256']}" if row["payload_sha256"] else ""
+            lines.append(
+                f"- `{row['source']}{account}:{row['event_id']}` "
+                f"({row['event_type']}, occurred_at={row['occurred_at']}){ref}{digest}"
+            )
+    if projections:
+        lines.append("### External projections")
+        for row in projections:
+            lines.append(
+                f"- `{row['system']}:{row['external_id']}`; "
+                f"state_sha256={row['state_hash']}; synced_at={row['last_synced_at']}"
+            )
+    if decisions:
+        lines.append("### Decisions")
+        for row in decisions:
+            outcome = row["action_ref"] or row["no_action_reason"] or "open"
+            lines.append(
+                f"- `{row['id']}` [{row['status']}]: {_ctx_cap(row['question'])}; "
+                f"answer={_ctx_cap(row['answer']) or '(none)'}; outcome={_ctx_cap(outcome)}"
+            )
+    if acceptance:
+        lines.append("### Acceptance requirements")
+        for row in acceptance:
+            evidence = _ctx_cap(row["evidence"]) if row["evidence"] else "(none)"
+            required = "required" if row["required"] else "optional"
+            lines.append(
+                f"- `{row['requirement_key']}` [{required}, {row['status']}]: "
+                f"{_ctx_cap(row['description'])}; expected_reviewer={row['expected_reviewer'] or '(any independent reviewer)'}; "
+                f"verified_by={row['verified_by'] or '(none)'}; "
+                f"artifact_sha256={row['artifact_sha256'] or '(none)'}; evidence={evidence}"
+            )
     lines.append("")
 
 

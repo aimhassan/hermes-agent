@@ -33,6 +33,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_ledger as ledger
 from hermes_cli.archive_safe import (
     archive_root_dirs,
     copy_regular_files,
@@ -48,7 +49,12 @@ ARCHIVE_FORMAT_VERSION = 1
 # if it is in one of these — terminal and already-parked tasks are left
 # alone rather than having their history rewritten.
 _DISPATCHABLE_STATUSES = ("ready", "running", "todo", "scheduled")
-_COUNTED_TABLES = ("tasks", "task_links", "task_comments", "task_events", "task_runs", "task_attachments")
+_COUNTED_TABLES = (
+    "tasks", "task_links", "task_comments", "task_events", "task_runs", "task_attachments",
+    "work_source_events", "work_source_cursors", "work_specs", "work_projections", "work_decisions",
+    "work_acceptance_requirements", "work_blocks", "work_owner_leases",
+    "work_task_owner_scopes", "work_feedback",
+)
 
 
 def _placeholders(items) -> str:
@@ -101,6 +107,16 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
         (int(time.time()),),
     )
     conn.execute("UPDATE task_runs SET claim_lock = NULL, worker_pid = NULL")
+    owner_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_owner_leases'"
+    ).fetchone()
+    if owner_table is not None:
+        # The owner and policy are portable configuration. The heartbeat is
+        # machine-local proof of liveness, so an importer must explicitly
+        # renew the lease before any bound task can run.
+        conn.execute(
+            "UPDATE work_owner_leases SET lease_expires_at=0, heartbeat_at=0, updated_at=0"
+        )
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -108,7 +124,16 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _count_rows(conn: sqlite3.Connection) -> dict[str, int]:
-    return {t: int(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]) for t in _COUNTED_TABLES}
+    existing = {
+        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    return {
+        table: (
+            int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            if table in existing else 0
+        )
+        for table in _COUNTED_TABLES
+    }
 
 
 def export_board(
@@ -346,6 +371,7 @@ def import_board(
 
     with kbc.connect_closing(board=target) as conn:
         stats, warnings = _relocate_imported_rows(conn, target)
+        ledger.adopt_legacy_tasks(conn)
         counts = _count_rows(conn)
 
     if activate:

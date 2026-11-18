@@ -448,7 +448,9 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 
 # --- Goal-mode judge gate ---
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({
+    "dependency", "needs_input", "external", "authentication", "quota",
+})
 
 
 def _goal_judge_available() -> bool:
@@ -795,6 +797,14 @@ def _handle_complete(args: dict, **kw) -> str:
                 raise _Reject(
                     f"could not complete {tid}: unsatisfied parent dependencies: "
                     f"{detail}; complete the parents first (done or archived)")
+            from hermes_cli.kanban_ledger import completion_blockers
+            ledger_blockers = completion_blockers(conn, tid)
+            if ledger_blockers:
+                detail = "; ".join(
+                    f"{item['kind']} {item['key']}: {item['detail']}"
+                    for item in ledger_blockers
+                )
+                raise _Reject(f"could not complete {tid}: {detail}")
             _check(False, (task.last_failure_error if task else None) or
                    f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
@@ -815,6 +825,9 @@ def _handle_block(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
+    responsible_party = _redact(args["responsible_party"]) if args.get("responsible_party") else None
+    unblock_condition = _redact(args["unblock_condition"]) if args.get("unblock_condition") else None
+    affected_ref = _redact(args["affected_ref"]) if args.get("affected_ref") else None
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
@@ -834,7 +847,12 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
+        ok = kb.block_task(
+            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+            responsible_party=responsible_party, unblock_condition=unblock_condition,
+            next_check_at=args.get("next_check_at"), escalation_at=args.get("escalation_at"),
+            affected_ref=affected_ref,
+        )
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}
@@ -1267,7 +1285,14 @@ def _handle_unblock(args: dict, **kw) -> str:
     tid = str(tid)
     _enforce_worker_task_ownership(tid)
     with _board(args.get("board")) as (kb, conn):
-        _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
+        answer = str(args.get("answer") or "").strip() or None
+        _check(
+            kb.unblock_task(
+                conn, tid, answer=answer,
+                actor=str(args.get("actor") or "orchestrator").strip() or "orchestrator",
+            ),
+            f"could not unblock {tid} (not blocked or unknown)",
+        )
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 

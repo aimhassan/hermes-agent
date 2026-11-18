@@ -31,6 +31,7 @@ if str(_WORKTREE) not in sys.path:
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_ledger as ledger
 from hermes_cli import kanban_transfer as kt
 from hermes_cli.archive_safe import normalize_archive_parts, safe_extract_targz
 
@@ -218,6 +219,56 @@ def test_gateway_subscriptions_never_travel(kanban_root, tmp_path):
         ).fetchone()[0] == 0
 
     assert b"12345" not in Path(archive).read_bytes()
+
+
+def test_work_ledger_travels_but_owner_liveness_does_not(kanban_root, tmp_path):
+    ids = _seed_board()
+    with kbc.connect_closing(board="alpha") as conn:
+        task_id = ids["scratch"]
+        ledger.ingest_source_event(
+            conn, source="mail", event_id="message-1", event_type="message", task_id=task_id,
+        )
+        ledger.sync_projection(
+            conn, system="crm", external_id="crm-1", task_id=task_id,
+        )
+        ledger.set_work_spec(
+            conn, task_id=task_id, objective="Handle the request",
+            expected_result="A verified result", urgency="high", risk_class="business",
+            value_score=75,
+        )
+        ledger.open_decision(
+            conn, decision_id="decision-1", task_id=task_id, question="Which option?",
+        )
+        ledger.record_feedback(
+            conn, feedback_id="feedback-1", task_id=task_id, outcome="edited",
+        )
+        ledger.set_owner_lease(
+            conn, scope="inbox", owner="coder", lease_seconds=600,
+            policy={"risk": "normal"},
+        )
+        ledger.bind_task_owner_scope(conn, task_id=task_id, scope="inbox")
+
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+    kanban_root("target")
+    result = kt.import_board(archive)
+
+    assert result["counts"]["work_source_events"] == 1
+    assert result["counts"]["work_specs"] == 2
+    assert result["counts"]["work_projections"] == 1
+    assert result["counts"]["work_decisions"] == 1
+    assert result["counts"]["work_feedback"] == 1
+    with kbc.connect_closing(board=result["board"]) as conn:
+        snapshot = ledger.task_ledger_snapshot(conn, ids["scratch"])
+        lease = conn.execute(
+            "SELECT owner, policy, lease_expires_at, heartbeat_at "
+            "FROM work_owner_leases WHERE scope='inbox'"
+        ).fetchone()
+        assert snapshot["sources"][0]["event_id"] == "message-1"
+        assert snapshot["spec"]["objective"] == "Handle the request"
+        assert snapshot["projections"][0]["external_id"] == "crm-1"
+        assert snapshot["decisions"][0]["id"] == "decision-1"
+        assert tuple(lease) == ("coder", '{"risk": "normal"}', 0, 0)
+        assert kb.claim_task(conn, ids["scratch"], claimer="worker") is None
 
 
 def test_unresolvable_workspaces_are_parked_not_dispatched(kanban_root, tmp_path):

@@ -108,7 +108,10 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {
+    "dependency", "needs_input", "external", "authentication", "capability",
+    "quota", "technical", "transient",
+}
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
@@ -982,6 +985,10 @@ CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
 
+from hermes_cli.kanban_ledger import LEDGER_SCHEMA_SQL
+
+SCHEMA_SQL += LEDGER_SCHEMA_SQL
+
 
 # --- ID generation ---
 
@@ -1323,6 +1330,11 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                from hermes_cli import kanban_ledger
+                kanban_ledger.ensure_task_contract(
+                    conn, task_id=task_id, title=title,
+                    idempotency_key=idempotency_key, now=now,
+                )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -2087,6 +2099,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                         "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
                         (resume_status, task_id),
                     )
+                from hermes_cli.kanban_ledger import resolve_active_block
+                resolve_active_block(
+                    conn, task_id, actor="dependency-gate",
+                    resolution=f"parents satisfied; promoted to {resume_status}",
+                )
                 _append_event(
                     conn, task_id, "promoted",
                     {"status": resume_status} if resume_status != "ready" else None,
@@ -2181,6 +2198,11 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_ledger import owner_claim_blocker
+        owner_blocker = owner_claim_blocker(conn, task_id, now=now)
+        if owner_blocker:
+            _append_event(conn, task_id, "claim_rejected", owner_blocker)
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2671,6 +2693,11 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    from hermes_cli.kanban_ledger import completion_blockers, record_completion_rejected
+    ledger_blockers = completion_blockers(conn, task_id)
+    if ledger_blockers:
+        record_completion_rejected(conn, task_id, ledger_blockers)
+        return False
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
@@ -2678,6 +2705,12 @@ def complete_task(
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
+            return False
+        # Decisions and acceptance may change after the pre-check. Repeat the
+        # gate under the same write lock as the terminal transition.
+        ledger_blockers = completion_blockers(conn, task_id)
+        if ledger_blockers:
+            _append_event(conn, task_id, "completion_rejected", {"blockers": ledger_blockers})
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
@@ -3125,6 +3158,9 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    responsible_party: Optional[str] = None, unblock_condition: Optional[str] = None,
+    next_check_at: Optional[int] = None, escalation_at: Optional[int] = None,
+    affected_ref: Optional[str] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3142,6 +3178,7 @@ def block_task(
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    from hermes_cli.kanban_ledger import record_block_opened
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -3166,9 +3203,15 @@ def block_task(
             ).rowcount
             if classified != 1:
                 return False
-            _append_event(conn, task_id, "blocked", {
+            payload = {
                 "kind": kind, "reason": reason, "classified_in_place": True,
-            })
+            }
+            payload.update(record_block_opened(
+                conn, task_id=task_id, kind=kind, reason=reason,
+                responsible_party=responsible_party, unblock_condition=unblock_condition,
+                next_check_at=next_check_at, escalation_at=escalation_at, affected_ref=affected_ref,
+            ))
+            _append_event(conn, task_id, "blocked", payload)
             return True
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         requested_kind = kind
@@ -3203,6 +3246,11 @@ def block_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
+        payload.update(record_block_opened(
+            conn, task_id=task_id, kind=kind, reason=reason,
+            responsible_party=responsible_party, unblock_condition=unblock_condition,
+            next_check_at=next_check_at, escalation_at=escalation_at, affected_ref=affected_ref,
+        ))
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
         )
@@ -3519,6 +3567,10 @@ def promote_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
+        from hermes_cli.kanban_ledger import resolve_active_block
+        resolve_active_block(
+            conn, task_id, actor=actor, resolution=reason or "manual promotion",
+        )
         _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
 
     return True, None
@@ -3554,9 +3606,44 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+ANSWER_PREFIXES = ("ANSWERED", "AIMAN")
+ANSWER_COMMENT_WINDOW_S = 120
+
+
+def recent_answer_text(
+    conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None,
+) -> Optional[str]:
+    """Return a fresh answer comment so two-step relays can record its decision text."""
+    row = conn.execute(
+        "SELECT body, created_at FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    body, created = row[0] or "", int(row[1] or 0)
+    fresh = (int(time.time()) if now is None else now) - created <= ANSWER_COMMENT_WINDOW_S
+    return body if fresh and body.lstrip().upper().startswith(ANSWER_PREFIXES) else None
+
+
+def recent_answer_comment(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None) -> bool:
+    """True when the task's newest comment is a fresh answer relay."""
+    return recent_answer_text(conn, task_id, now=now) is not None
+
+
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    answered: bool = False,
+    answer: Optional[str] = None,
+    actor: str = "operator",
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    ``answered=True`` marks the unblock as carrying a human answer to the
+    block's question. This resets the same-kind loop counter so a later, new
+    question can wait normally. An automatic retry keeps the counter."""
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -3575,26 +3662,40 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # resetting them is the amnesia that let cron-unblock <-> re-block loop
-        # unbounded; only complete_task clears them. ``consecutive_failures``
-        # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
+        answered = answered or answer is not None
+        reset = ", block_kind = NULL, block_recurrences = 0" if answered else ""
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL" + reset + " "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+        from hermes_cli.kanban_ledger import answer_open_block_decisions, resolve_active_block
+        block_resolved = resolve_active_block(
+            conn, task_id, actor=actor, resolution=f"unblocked to {new_status}",
         )
+        decisions_answered = (
+            answer_open_block_decisions(
+                conn, task_id, answer=answer, actor=actor,
+            )
+            if answer is not None else 0
+        )
+        payload = (
+            {
+                "status": new_status, "resume_status": resume_status,
+                "block_resolved": block_resolved,
+                "decisions_answered": decisions_answered,
+            }
+            if (
+                new_status != "ready" or resume_status != "ready"
+                or block_resolved or decisions_answered
+            )
+            else {}
+        )
+        if answered:
+            payload["answered"] = True
+        _append_event(conn, task_id, "unblocked", payload or None)
         return True
 
 
@@ -3838,6 +3939,11 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
+    for table in (
+        "work_blocks", "work_decisions", "work_acceptance_requirements",
+        "work_task_owner_scopes", "work_feedback", "work_specs",
+    ):
+        conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -3845,6 +3951,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     archived first so data loss takes two deliberate actions."""
     with write_txn(conn):
         if _task_status(conn, task_id) != "archived":
+            return False
+        from hermes_cli.kanban_ledger import has_external_identity
+        if has_external_identity(conn, task_id):
             return False
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -3854,6 +3963,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
     with write_txn(conn):
+        from hermes_cli.kanban_ledger import has_external_identity
+        if has_external_identity(conn, task_id):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -3903,12 +4015,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         raise ValueError(f"unknown task {task_id}")
     from hermes_cli.kanban_db_context import (
         _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_prior_attempts,
-        _ctx_role_history,
+        _ctx_role_history, _ctx_work_ledger,
     )
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    _ctx_work_ledger(lines, conn, task_id)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
@@ -4070,130 +4183,6 @@ def read_worker_log(
         return None
 
 
-# --- Assignee enumeration (known profiles + per-profile board stats) ---
-
-def list_profiles_on_disk() -> list[str]:
-    """Profiles with a ``config.yaml`` plus the implicit ``default``; reads paths
-    directly to avoid importing ``hermes_cli.profiles`` at startup."""
-    try:
-        from hermes_constants import get_default_hermes_root
-        default_root = get_default_hermes_root()
-        profiles_dir = default_root / "profiles"
-    except Exception:
-        return []
-
-    names: set[str] = set()
-    if default_root.exists():
-        names.add("default")
-    if profiles_dir.is_dir():
-        try:
-            names.update(e.name for e in profiles_dir.iterdir() if e.is_dir() and (e / "config.yaml").is_file())  # config-reader: ok — profile directory discovery marker
-        except OSError:
-            pass
-    return sorted(names)
-
-
-def known_assignees(conn: sqlite3.Connection) -> list[dict]:
-    """``{"name", "on_disk", "counts"}`` for every on-disk profile or task
-    assignee, so a fresh profile appears in pickers before it has a task."""
-    on_disk = set(list_profiles_on_disk())
-    counts = _counts_by_assignee(conn)
-    return [
-        {"name": name, "on_disk": name in on_disk, "counts": counts.get(name, {})}
-        for name in sorted(on_disk | set(counts))
-    ]
-
-
-# --- Runs (attempt history on a task) ---
-
-def list_runs(
-    conn: sqlite3.Connection, task_id: str, *, include_active: bool = True,
-    state_type: Optional[str] = None, state_name: Optional[str] = None,
-) -> list[Run]:
-    """Runs in start order; ``include_active=False`` = closed only; ``state_type``
-    (``status``/``outcome``) + ``state_name`` filter together."""
-    if (state_type is None) ^ (state_name is None):
-        raise ValueError("state_type and state_name must both be set or both omitted")
-    if state_type is not None and state_type not in ("status", "outcome"):
-        raise ValueError("state_type must be 'status' or 'outcome'")
-    q = "SELECT * FROM task_runs WHERE task_id = ?"
-    params: list[Any] = [task_id]
-    if not include_active:
-        q += " AND ended_at IS NOT NULL"
-    if state_type is not None:
-        q += f" AND {state_type} = ?"
-        params.append(state_name)
-    q += " ORDER BY started_at ASC, id ASC"
-    rows = conn.execute(q, params).fetchall()
-    return [Run.from_row(r) for r in rows]
-
-
-def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
-    row = conn.execute("SELECT * FROM task_runs WHERE id = ?", (int(run_id),)).fetchone()
-    return Run.from_row(row) if row else None
-
-
-def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
-    """Return the most recent run regardless of outcome (active or closed)."""
-    row = conn.execute(
-        "SELECT * FROM task_runs WHERE task_id = ? "
-        "ORDER BY started_at DESC, id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    return Run.from_row(row) if row else None
-
-
-def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Newest non-empty run summary, or None. Workers hand off via ``summary`` and
-    leave ``tasks.result`` NULL, so views need this or a done task looks empty."""
-    row = conn.execute(
-        "SELECT summary FROM task_runs "
-        "WHERE task_id = ? AND summary IS NOT NULL AND summary != '' "
-        "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    return row["summary"] if row else None
-
-
-def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, str]:
-    """``{task_id: newest non-empty run summary}`` in one query (window function,
-    SQLite >= 3.25); tasks without a summary are omitted."""
-    ids = list(task_ids)
-    if not ids:
-        return {}
-    placeholders = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"""
-        SELECT task_id, summary FROM (
-            SELECT task_id, summary,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY task_id
-                       ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
-                   ) AS rn
-              FROM task_runs
-             WHERE task_id IN ({placeholders})
-               AND summary IS NOT NULL AND summary != ''
-        ) WHERE rn = 1
-        """,
-        ids,
-    ).fetchall()
-    return {r["task_id"]: r["summary"] for r in rows}
-
-
-def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, int]:
-    """``{task_id: started_at of the run ``tasks.current_run_id`` points at}``
-    in one query; tasks with no active run (NULL or dangling pointer) are omitted."""
-    ids = list(task_ids)
-    if not ids:
-        return {}
-    placeholders = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        "SELECT t.id AS task_id, r.started_at AS started_at FROM tasks t "
-        "JOIN task_runs r ON r.id = t.current_run_id "
-        f"WHERE t.id IN ({placeholders})",
-        ids,
-    ).fetchall()
-    return {r["task_id"]: r["started_at"] for r in rows}
-
-
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 from hermes_cli.kanban_db_boards import (
     _default_board_display_name,
@@ -4204,6 +4193,15 @@ from hermes_cli.kanban_db_boards import (
     read_board_metadata,
     remove_board,
     write_board_metadata,
+)
+from hermes_cli.kanban_db_assignees import known_assignees, list_profiles_on_disk
+from hermes_cli.kanban_db_runs import (
+    current_run_started_ats,
+    get_run,
+    latest_run,
+    latest_summaries,
+    latest_summary,
+    list_runs,
 )
 from hermes_cli.kanban_db_connect import (
     _INITIALIZED_PATHS,
