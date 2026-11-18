@@ -3606,15 +3606,44 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
+ANSWER_PREFIXES = ("ANSWERED", "AIMAN")
+ANSWER_COMMENT_WINDOW_S = 120
+
+
+def recent_answer_text(
+    conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None,
+) -> Optional[str]:
+    """Return a fresh answer comment so two-step relays can record its decision text."""
+    row = conn.execute(
+        "SELECT body, created_at FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    body, created = row[0] or "", int(row[1] or 0)
+    fresh = (int(time.time()) if now is None else now) - created <= ANSWER_COMMENT_WINDOW_S
+    return body if fresh and body.lstrip().upper().startswith(ANSWER_PREFIXES) else None
+
+
+def recent_answer_comment(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None) -> bool:
+    """True when the task's newest comment is a fresh answer relay."""
+    return recent_answer_text(conn, task_id, now=now) is not None
+
+
 def unblock_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
+    answered: bool = False,
     answer: Optional[str] = None,
     actor: str = "operator",
 ) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    ``answered=True`` marks the unblock as carrying a human answer to the
+    block's question. This resets the same-kind loop counter so a later, new
+    question can wait normally. An automatic retry keeps the counter."""
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -3633,14 +3662,11 @@ def unblock_task(
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # resetting them is the amnesia that let cron-unblock <-> re-block loop
-        # unbounded; only complete_task clears them. ``consecutive_failures``
-        # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
+        answered = answered or answer is not None
+        reset = ", block_kind = NULL, block_recurrences = 0" if answered else ""
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL" + reset + " "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -3655,21 +3681,21 @@ def unblock_task(
             )
             if answer is not None else 0
         )
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {
-                    "status": new_status, "resume_status": resume_status,
-                    "block_resolved": block_resolved,
-                    "decisions_answered": decisions_answered,
-                }
-                if (
-                    new_status != "ready" or resume_status != "ready"
-                    or block_resolved or decisions_answered
-                )
-                else None
-            ),
+        payload = (
+            {
+                "status": new_status, "resume_status": resume_status,
+                "block_resolved": block_resolved,
+                "decisions_answered": decisions_answered,
+            }
+            if (
+                new_status != "ready" or resume_status != "ready"
+                or block_resolved or decisions_answered
+            )
+            else {}
         )
+        if answered:
+            payload["answered"] = True
+        _append_event(conn, task_id, "unblocked", payload or None)
         return True
 
 

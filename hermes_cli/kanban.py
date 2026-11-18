@@ -1043,12 +1043,19 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = _stripped_or_none(getattr(args, "reason", None))
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
+    answered = bool(getattr(args, "answered", False)) or bool(
+        reason and reason.lstrip().upper().startswith(kb.ANSWER_PREFIXES)
+    )
     with kbc.connect_closing() as conn:
+        def unblock(tid):
+            decision_answer = reason if answered else kb.recent_answer_text(conn, tid)
+            return kb.unblock_task(
+                conn, tid, answer=decision_answer, actor=author or "operator",
+                answered=answered or decision_answer is not None,
+            )
+
         op = _commented(
-            conn, reason, author, "UNBLOCK",
-            lambda tid: kb.unblock_task(
-                conn, tid, answer=reason, actor=author or "operator",
-            ),
+            conn, reason, author, "UNBLOCK", unblock,
         )
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
