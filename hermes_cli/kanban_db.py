@@ -1330,6 +1330,11 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                from hermes_cli import kanban_ledger
+                kanban_ledger.ensure_task_contract(
+                    conn, task_id=task_id, title=title,
+                    idempotency_key=idempotency_key, now=now,
+                )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

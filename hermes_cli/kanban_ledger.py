@@ -175,6 +175,9 @@ SOURCE_DISPOSITIONS = frozenset({"created", "linked", "ignored"})
 DECISION_STATUSES = frozenset({"open", "answered", "cancelled"})
 ACCEPTANCE_STATUSES = frozenset({"pending", "passed", "failed", "waived"})
 URGENCY_LEVELS = frozenset({"low", "normal", "high", "critical"})
+DEFAULT_EXPECTED_RESULT = (
+    "A verified result that satisfies the task brief and any completion contract."
+)
 
 _BLOCK_DEFAULT_PARTY = {
     "dependency": "parent-task",
@@ -201,6 +204,14 @@ class SourceIngestResult:
     created: bool
 
 
+@dataclass(frozen=True)
+class TaskAdoptionResult:
+    """Rows added while bringing a kanban task under the ledger contract."""
+
+    spec_created: bool
+    source_created: bool
+
+
 def _required_text(value: Any, label: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -219,6 +230,117 @@ def _json_digest(payload: Any) -> Optional[str]:
 
 def _source_identity(source: str, account: Optional[str], event_id: str) -> tuple[str, str, str]:
     return _required_text(source, "source"), str(account or "").strip(), _required_text(event_id, "event_id")
+
+
+def _legacy_source_identity(idempotency_key: Optional[str]) -> Optional[tuple[str, str]]:
+    """Project an existing deduplication key into a stable, content-free source identity."""
+    key = str(idempotency_key or "").strip()
+    if not key:
+        return None
+    source, separator, event_id = key.partition(":")
+    if source == "source" and separator:
+        return None
+    if not separator or not source.strip() or not event_id.strip():
+        return "legacy-idempotency", key
+    return source.strip(), event_id.strip()
+
+
+def ensure_task_contract(
+    conn,
+    *,
+    task_id: str,
+    title: str,
+    idempotency_key: Optional[str] = None,
+    now: Optional[int] = None,
+) -> TaskAdoptionResult:
+    """Give a task a baseline outcome contract and preserve its legacy source key.
+
+    Revision zero is deliberately replaceable by the first explicit ``set_work_spec``
+    call without a compare-and-set token. This keeps legacy creators compatible while
+    ensuring every new card immediately participates in outcome ordering and audit.
+    """
+    task_id = _required_text(task_id, "task_id")
+    title = _required_text(title, "title")
+    timestamp = int(time.time()) if now is None else int(now)
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import write_txn
+
+    with write_txn(conn, allow_nested=True):
+        if kb.get_task(conn, task_id) is None:
+            raise ValueError(f"no such task: {task_id}")
+        inserted = conn.execute(
+            """
+            INSERT INTO work_specs (
+                task_id, objective, expected_result, deadline_at, safety_margin_seconds,
+                urgency, risk_class, value_score, revision, updated_at
+            ) VALUES (?, ?, ?, NULL, 0, 'normal', 'normal', 0, 0, ?)
+            ON CONFLICT(task_id) DO NOTHING
+            """,
+            (task_id, title, DEFAULT_EXPECTED_RESULT, timestamp),
+        ).rowcount > 0
+        if inserted:
+            kb._append_event(
+                conn, task_id, "work_spec_adopted",
+                {"revision": 0, "objective": title, "source": "kanban-compatibility"},
+            )
+
+        source_created = False
+        identity = _legacy_source_identity(idempotency_key)
+        if identity is not None:
+            source, event_id = identity
+            row = conn.execute(
+                "SELECT task_id FROM work_source_events WHERE source=? AND account='' AND event_id=?",
+                (source, event_id),
+            ).fetchone()
+            if row is not None and row["task_id"] != task_id:
+                raise LedgerConflict(
+                    f"legacy source {source}:{event_id} already belongs to {row['task_id']}"
+                )
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO work_source_events (
+                        source, account, event_id, event_type, task_id, disposition,
+                        occurred_at, raw_ref, payload_sha256, ignored_reason, ingested_at
+                    ) VALUES (?, '', ?, 'kanban_idempotency', ?, 'linked', NULL, NULL, NULL, NULL, ?)
+                    """,
+                    (source, event_id, task_id, timestamp),
+                )
+                kb._append_event(
+                    conn, task_id, "source_ingested",
+                    {
+                        "source": source, "account": None, "event_id": event_id,
+                        "event_type": "kanban_idempotency", "disposition": "linked",
+                        "occurred_at": None, "raw_ref": None, "payload_sha256": None,
+                    },
+                )
+                source_created = True
+        return TaskAdoptionResult(spec_created=inserted, source_created=source_created)
+
+
+def adopt_legacy_tasks(conn) -> dict[str, int]:
+    """Idempotently bring every existing kanban task under the ledger contract."""
+    from hermes_cli.kanban_db_connect import write_txn
+
+    rows = conn.execute(
+        "SELECT id, title, idempotency_key FROM tasks ORDER BY created_at, id"
+    ).fetchall()
+    specs_created = 0
+    sources_created = 0
+    with write_txn(conn):
+        for row in rows:
+            result = ensure_task_contract(
+                conn, task_id=row["id"], title=row["title"],
+                idempotency_key=row["idempotency_key"],
+            )
+            specs_created += int(result.spec_created)
+            sources_created += int(result.source_created)
+    return {
+        "tasks_seen": len(rows),
+        "specs_created": specs_created,
+        "sources_created": sources_created,
+    }
 
 
 def _existing_source_result(
@@ -519,11 +641,14 @@ def set_work_spec(
             revision = 1
         else:
             current = int(row["revision"])
-            if expected_revision != current:
+            if current == 0 and expected_revision in (None, 0):
+                revision = 1
+            elif expected_revision != current:
                 raise LedgerConflict(
                     f"work spec revision moved; expected {expected_revision!r}, found {current}"
                 )
-            revision = current + 1
+            else:
+                revision = current + 1
         now = int(time.time())
         conn.execute(
             """
@@ -1274,6 +1399,30 @@ def ledger_audit(conn, *, now: Optional[int] = None) -> dict[str, Any]:
         if ref is not None:
             finding["ref"] = ref
         findings.append(finding)
+
+    for row in conn.execute(
+        """
+        SELECT t.id, t.idempotency_key, s.task_id AS spec_task_id,
+               EXISTS(SELECT 1 FROM work_source_events e WHERE e.task_id=t.id) AS has_source
+          FROM tasks t LEFT JOIN work_specs s ON s.task_id=t.id
+         WHERE s.task_id IS NULL
+            OR (t.idempotency_key IS NOT NULL AND t.idempotency_key!=''
+                AND NOT EXISTS(SELECT 1 FROM work_source_events e WHERE e.task_id=t.id))
+         ORDER BY t.id
+        """
+    ):
+        if row["spec_task_id"] is None:
+            add(
+                "missing_work_spec", "error",
+                "Canonical task has no machine-readable outcome contract.",
+                task_id=row["id"],
+            )
+        if row["idempotency_key"] and not row["has_source"]:
+            add(
+                "idempotency_without_source", "error",
+                "Task has a durable producer key but no linked source event.",
+                task_id=row["id"], ref=row["idempotency_key"],
+            )
 
     for row in conn.execute(
         """

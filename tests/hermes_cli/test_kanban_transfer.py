@@ -253,7 +253,7 @@ def test_work_ledger_travels_but_owner_liveness_does_not(kanban_root, tmp_path):
     result = kt.import_board(archive)
 
     assert result["counts"]["work_source_events"] == 1
-    assert result["counts"]["work_specs"] == 1
+    assert result["counts"]["work_specs"] == 2
     assert result["counts"]["work_projections"] == 1
     assert result["counts"]["work_decisions"] == 1
     assert result["counts"]["work_feedback"] == 1

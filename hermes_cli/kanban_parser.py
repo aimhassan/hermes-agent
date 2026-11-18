@@ -147,6 +147,7 @@ _BOARD_SPECS = [
 ]
 
 _LEDGER_SPECS = [
+    _cmd("adopt-legacy", help="Adopt every existing kanban task into the work ledger"),
     _cmd("ingest-source", [
         _arg("source", help="Source system name"),
         _arg("event_id", help="Immutable event id in that source"),

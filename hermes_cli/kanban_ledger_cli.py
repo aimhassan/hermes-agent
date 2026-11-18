@@ -59,6 +59,8 @@ def dispatch(args) -> int:
         raise ValueError("ledger action is required")
 
     with kbc.connect_closing() as conn:
+        if action == "adopt-legacy":
+            return _emit(ledger.adopt_legacy_tasks(conn))
         if action == "ingest-source":
             return _emit(_ingest(conn, args))
         if action == "advance-cursor":

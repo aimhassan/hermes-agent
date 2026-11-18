@@ -59,6 +59,66 @@ def test_source_event_creates_one_task_across_retries(conn):
     assert "wamid.123" in event["payload"]
 
 
+def test_every_created_task_gets_a_replaceable_baseline_spec_and_source(conn):
+    task_id = kb.create_task(
+        conn, title="Prepare the source-backed result", idempotency_key="crm:task-42",
+    )
+
+    spec = conn.execute(
+        "SELECT objective, expected_result, revision FROM work_specs WHERE task_id=?", (task_id,),
+    ).fetchone()
+    assert tuple(spec) == (
+        "Prepare the source-backed result", ledger.DEFAULT_EXPECTED_RESULT, 0,
+    )
+    source = conn.execute(
+        "SELECT source, event_id, event_type, task_id FROM work_source_events"
+    ).fetchone()
+    assert tuple(source) == ("crm", "task-42", "kanban_idempotency", task_id)
+    assert ledger.set_work_spec(
+        conn, task_id=task_id, objective="Prepare the verified CRM result",
+        expected_result="The CRM task is completed and read back",
+    ) == 1
+
+
+def test_legacy_adoption_is_idempotent_and_covers_tasks_without_keys(conn):
+    now = int(time.time())
+    with kbc.write_txn(conn):
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, created_at, workspace_kind) "
+            "VALUES ('legacy-no-key', 'Legacy card', 'ready', 0, ?, 'scratch')",
+            (now,),
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, created_at, workspace_kind, idempotency_key) "
+            "VALUES ('legacy-keyed', 'Legacy keyed card', 'ready', 0, ?, 'scratch', 'old-key')",
+            (now,),
+        )
+
+    first = ledger.adopt_legacy_tasks(conn)
+    second = ledger.adopt_legacy_tasks(conn)
+    assert first == {"tasks_seen": 2, "specs_created": 2, "sources_created": 1}
+    assert second == {"tasks_seen": 2, "specs_created": 0, "sources_created": 0}
+    assert conn.execute("SELECT COUNT(*) FROM work_specs").fetchone()[0] == 2
+    source = conn.execute(
+        "SELECT source, event_id, task_id FROM work_source_events"
+    ).fetchone()
+    assert tuple(source) == ("legacy-idempotency", "old-key", "legacy-keyed")
+
+
+def test_audit_exposes_tasks_that_bypass_canonical_creation(conn):
+    with kbc.write_txn(conn):
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, created_at, workspace_kind, idempotency_key) "
+            "VALUES ('bypass', 'Bypassed task', 'ready', 0, ?, 'scratch', 'crm:bypass')",
+            (int(time.time()),),
+        )
+
+    report = ledger.ledger_audit(conn)
+    assert {item["kind"] for item in report["findings"]} == {
+        "missing_work_spec", "idempotency_without_source",
+    }
+
+
 def test_source_event_conflict_is_visible(conn):
     ledger.ingest_source_event(
         conn, source="crm", event_id="task-1", event_type="created",
