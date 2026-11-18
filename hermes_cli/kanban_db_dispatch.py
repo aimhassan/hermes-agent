@@ -27,6 +27,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_db_dispatch_order import lane_rows as _lane_rows
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -2291,15 +2292,6 @@ def _tick_spawn_budget(
             )
             spawn_budget = 1
     return True, spawn_budget
-
-
-def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
-    return conn.execute(
-        "SELECT id, assignee FROM tasks "
-        f"WHERE status = '{status}' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
 
 
 def _any_spawnable_review(

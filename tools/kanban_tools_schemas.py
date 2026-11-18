@@ -168,11 +168,13 @@ KANBAN_BLOCK_SCHEMA = _schema(
     "kanban_block",
     (
         "Stop work on this task and route it according to WHY you're stuck. "
-        "Set ``kind`` to say which: 'dependency' (waiting on another task — "
+        "Set ``kind`` to say which: 'dependency' (waiting on another task, "
         "goes to todo and auto-resumes when that task finishes, no human "
         "needed), 'needs_input' (you need a human decision/answer), "
-        "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "'external' (waiting on another person or organization), "
+        "'authentication' (a login or credential is required), 'capability' "
+        "(an action no agent can do), 'quota' (provider capacity is exhausted), "
+        "'technical' (a durable system fault), or 'transient' (a flaky failure). "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
@@ -187,7 +189,10 @@ KANBAN_BLOCK_SCHEMA = _schema(
         )),
         "kind": {
             "type": "string",
-            "enum": ["dependency", "needs_input", "capability", "transient"],
+            "enum": [
+                "dependency", "needs_input", "external", "authentication",
+                "capability", "quota", "technical", "transient",
+            ],
             "description": (
                 "Why you're blocked. 'dependency' waits in todo and "
                 "resumes automatically when an incomplete parent finishes; "
@@ -195,6 +200,14 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "The others surface to a human. Omit only if none apply."
             ),
         },
+        "responsible_party": _prop(
+            "string", "Person, team, provider, or system responsible for unblocking."),
+        "unblock_condition": _prop(
+            "string", "Exact observable condition that makes the task runnable again."),
+        "next_check_at": _prop("integer", "Next check time as Unix seconds."),
+        "escalation_at": _prop("integer", "Escalation time as Unix seconds."),
+        "affected_ref": _prop(
+            "string", "Affected artifact, integration, account, or dependency reference."),
     },
     ["reason"],
 )

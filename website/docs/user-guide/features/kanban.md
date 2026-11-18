@@ -35,6 +35,102 @@ The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
 
+## Canonical work ledger
+
+Source readers and external task systems can use the board as one work ledger
+instead of creating separate, drifting copies. The ledger is opt-in. Existing
+boards and ordinary cards continue to work without migration.
+
+The contract has seven parts:
+
+1. Each source event has one immutable identity: source, account, and event id.
+2. Every event is linked to a task, creates a task atomically, or records an
+   explicit ignored reason. A conflicting retry fails instead of overwriting.
+3. Each external projection, such as a CRM row or Radar entry, can belong to
+   only one task.
+4. Each opted-in task has a machine-readable objective, expected result,
+   deadline safety margin, urgency, risk class, value score, and revision.
+5. Each question has one decision id. An answer must name the resulting action
+   or state why no action is needed.
+6. Required acceptance checks block completion until independent evidence
+   passes or an explicit user waiver is recorded. A waiver must include both
+   `waiver_reason` and `user_approval_ref` in its evidence object.
+7. Each block records who owns the unblock, the observable unblock condition,
+   its next check and escalation times, and the affected reference.
+8. Owner scopes are live leases. A bound task can be claimed only by the
+   current live owner.
+
+Use `hermes kanban ledger` from readers, integrations, and operational scripts.
+All ledger commands emit JSON.
+
+```bash
+# Create work exactly once from an immutable mail event.
+hermes kanban ledger ingest-source mail message-42 message \
+  --account work --raw-ref 'gmail://thread/abc/message/42' \
+  --payload-sha256 "$CONTENT_DIGEST" \
+  --create-title 'Prepare the requested document' --assignee inbox
+
+# Advance only from the cursor the reader actually observed.
+hermes kanban ledger advance-cursor mail page-18 \
+  --account work --previous-cursor page-17 --backlog 0 --freshness-sla 600
+
+# Make CRM and Radar rows projections of the same task.
+hermes kanban ledger sync-projection twenty crm-task-92 t_abcd \
+  --state-json '{"status":"OPEN"}'
+
+# Give dispatch and review an explicit outcome, deadline, value, and risk.
+hermes kanban ledger set-spec t_abcd 'Submit the correct application' \
+  'A source-verified submission visible in the portal' \
+  --deadline-at 1795000000 --safety-margin 86400 \
+  --urgency high --risk-class grant --value-score 95
+
+# Open and close one decision across all delivery channels.
+hermes kanban ledger open-decision decision-budget t_abcd 'Which budget option?'
+hermes kanban ledger answer-decision decision-budget 'Use option B' \
+  --actor user --action-ref t_followup
+
+# Require independent, fingerprinted acceptance evidence.
+hermes kanban ledger require-acceptance t_abcd final-readback \
+  'The external system shows the intended result' --expected-reviewer reviewer
+hermes kanban ledger record-acceptance t_abcd final-readback passed \
+  --verified-by reviewer --evidence-json '{"readback":"matched"}' \
+  --artifact ./final-report.pdf
+```
+
+A source adapter should commit events before advancing its cursor. If it
+crashes after event ingestion, the retry is idempotent. If it crashes before
+cursor advancement, it rereads the same range safely. Cursor advancement uses
+compare-and-set, so a stale reader cannot skip over another reader's work.
+
+Owner migration is also explicit:
+
+```bash
+hermes kanban ledger set-owner inbox inbox-owner \
+  --lease-seconds 900 --backup-owner inbox-backup
+hermes kanban ledger bind-owner t_abcd inbox
+hermes kanban ledger heartbeat-owner inbox inbox-owner --lease-seconds 900
+hermes kanban ledger owners
+
+# Feed accepted outcomes and user corrections back into measurable learning.
+hermes kanban ledger record-feedback draft-42 rewritten \
+  --task-id t_abcd --channel gmail --category business \
+  --correction-sha256 "$EDIT_DIGEST"
+```
+
+Use `hermes kanban ledger show <task-id>` for the combined source, projection,
+decision, block, and acceptance view. Use `hermes kanban ledger metrics` for
+source freshness, backlog, open decisions, expired owner leases, stale claims,
+acceptance debt, and waiting counts by cause.
+Feedback outcomes such as acted, dismissed, sent as written, edited, rewritten,
+false alert, and repeated question are counters in the same metrics response.
+
+Run `hermes kanban ledger audit` from acceptance monitoring. It is read-only
+and exits nonzero when it finds an orphaned source or projection, an answered
+decision without an action disposition, a completed task with unresolved
+obligations, an untyped blocked task, or a task whose bound owner lease is
+missing, expired, or mismatched. This turns cross-system drift into a visible
+failure instead of another reconciliation job.
+
 This is the shape that covers the workloads `delegate_task` can't:
 
 - **Research triage** — parallel researchers + analyst + writer, human-in-the-loop.

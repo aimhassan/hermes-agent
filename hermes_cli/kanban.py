@@ -225,6 +225,9 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     if action == "boards":
         if (getattr(args, "boards_action", None) or "list") not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
             return False
+    elif action == "ledger":
+        if getattr(args, "ledger_action", None) in {"show", "metrics", "owners", "audit"}:
+            return False
     elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
         return False
     from agent.delegation_context import kanban_path_is_fenced
@@ -939,6 +942,15 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
                     fail_msg[tid] = (f"cannot complete {tid}: unsatisfied parent dependencies: {detail}; "
                                      f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
+                else:
+                    from hermes_cli.kanban_ledger import completion_blockers
+                    ledger_blockers = completion_blockers(conn, tid)
+                    if ledger_blockers:
+                        detail = "; ".join(
+                            f"{item['kind']} {item['key']}: {item['detail']}"
+                            for item in ledger_blockers
+                        )
+                        fail_msg[tid] = f"cannot complete {tid}: {detail}"
             return done
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
@@ -1002,7 +1014,12 @@ def _cmd_block(args: argparse.Namespace) -> int:
             return f"Blocked {tid}{suffix}"
 
         op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
+            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
+            responsible_party=getattr(args, "responsible", None),
+            unblock_condition=getattr(args, "unblock_condition", None),
+            next_check_at=getattr(args, "next_check_at", None),
+            escalation_at=getattr(args, "escalate_at", None),
+            affected_ref=getattr(args, "affected_ref", None)))
         return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
 
 
@@ -1317,8 +1334,14 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
 
 
+def _cmd_ledger(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_ledger_cli import dispatch
+
+    return dispatch(args)
+
+
 _HANDLERS = {
-    "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
+    "init": _cmd_init, "ledger": _cmd_ledger, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
