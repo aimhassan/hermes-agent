@@ -328,6 +328,8 @@ def adopt_legacy_tasks(conn) -> dict[str, int]:
     ).fetchall()
     specs_created = 0
     sources_created = 0
+    blocks_created = 0
+    decisions_created = 0
     with write_txn(conn):
         for row in rows:
             result = ensure_task_contract(
@@ -336,10 +338,41 @@ def adopt_legacy_tasks(conn) -> dict[str, int]:
             )
             specs_created += int(result.spec_created)
             sources_created += int(result.source_created)
+        blocked = conn.execute(
+            """
+            SELECT t.id, t.block_kind
+              FROM tasks t
+             WHERE t.status='blocked'
+               AND NOT EXISTS(
+                   SELECT 1 FROM work_blocks b
+                    WHERE b.task_id=t.id AND b.resolved_at IS NULL
+               )
+             ORDER BY t.created_at, t.id
+            """
+        ).fetchall()
+        for row in blocked:
+            event = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? "
+                "AND kind IN ('blocked', 'block_loop_detected', 'gave_up') "
+                "ORDER BY id DESC LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            try:
+                payload = json.loads(event["payload"] or "{}") if event is not None else {}
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            reason = payload.get("reason") if isinstance(payload, dict) else None
+            details = record_block_opened(
+                conn, task_id=row["id"], kind=row["block_kind"], reason=reason,
+            )
+            blocks_created += 1
+            decisions_created += int("decision_id" in details)
     return {
         "tasks_seen": len(rows),
         "specs_created": specs_created,
         "sources_created": sources_created,
+        "blocks_created": blocks_created,
+        "decisions_created": decisions_created,
     }
 
 
@@ -831,10 +864,17 @@ def record_block_opened(
         "SELECT id FROM work_blocks WHERE task_id=? AND resolved_at IS NULL", (task_id,),
     ).fetchone()
     if prior is not None:
+        prior_decision_id = f"block:{int(prior['id'])}"
         conn.execute(
             "UPDATE work_blocks SET resolved_at=?, resolved_by='lifecycle', "
             "resolution='superseded by a new block episode' WHERE id=?",
             (now, int(prior["id"])),
+        )
+        conn.execute(
+            "UPDATE work_decisions SET status='cancelled', "
+            "no_action_reason='superseded by a new block episode', updated_at=? "
+            "WHERE id=? AND status='open'",
+            (now, prior_decision_id),
         )
     cur = conn.execute(
         """
@@ -855,6 +895,28 @@ def record_block_opened(
     }
     if prior is not None:
         details["superseded_block_id"] = int(prior["id"])
+    if normalized_kind == "needs_input":
+        decision_id = f"block:{int(cur.lastrowid)}"
+        conn.execute(
+            """
+            INSERT INTO work_decisions (
+                id, task_id, question, status, source_ref, created_at, updated_at
+            ) VALUES (?, ?, ?, 'open', ?, ?, ?)
+            """,
+            (
+                decision_id, task_id, str(reason or condition).strip(),
+                f"kanban:{task_id}:block:{int(cur.lastrowid)}", now, now,
+            ),
+        )
+        from hermes_cli import kanban_db as kb
+        kb._append_event(
+            conn, task_id, "decision_opened",
+            {
+                "decision_id": decision_id, "question": str(reason or condition).strip(),
+                "source_ref": f"kanban:{task_id}:block:{int(cur.lastrowid)}",
+            },
+        )
+        details["decision_id"] = decision_id
     return details
 
 
@@ -866,6 +928,47 @@ def resolve_active_block(conn, task_id: str, *, actor: str, resolution: str) -> 
         "WHERE task_id=? AND resolved_at IS NULL",
         (now, _required_text(actor, "actor"), _required_text(resolution, "resolution"), task_id),
     ).rowcount == 1
+
+
+def answer_open_block_decisions(
+    conn,
+    task_id: str,
+    *,
+    answer: str,
+    actor: str,
+    action_ref: Optional[str] = None,
+) -> int:
+    """Answer every open decision created by the task's block episodes.
+
+    Caller holds the write transaction. Resuming the canonical task is the
+    resulting action unless the caller provides a more specific reference.
+    """
+    answer = _required_text(answer, "answer")
+    actor = _required_text(actor, "actor")
+    action_ref = _required_text(action_ref or f"task:{task_id}", "action_ref")
+    rows = conn.execute(
+        "SELECT id FROM work_decisions WHERE task_id=? AND status='open' "
+        "AND id LIKE 'block:%' ORDER BY created_at, id",
+        (task_id,),
+    ).fetchall()
+    if not rows:
+        return 0
+    now = int(time.time())
+    from hermes_cli import kanban_db as kb
+    for row in rows:
+        conn.execute(
+            "UPDATE work_decisions SET status='answered', answer=?, action_ref=?, "
+            "answered_at=?, updated_at=? WHERE id=? AND status='open'",
+            (answer, action_ref, now, now, row["id"]),
+        )
+        kb._append_event(
+            conn, task_id, "decision_answered",
+            {
+                "decision_id": row["id"], "answer": answer,
+                "actor": actor, "action_ref": action_ref,
+            },
+        )
+    return len(rows)
 
 
 def set_owner_lease(
@@ -1499,6 +1602,24 @@ def ledger_audit(conn, *, now: Optional[int] = None) -> dict[str, Any]:
                 "Done task still has an open decision, active block, or required acceptance debt.",
                 task_id=row["id"],
             )
+
+    for row in conn.execute(
+        """
+        SELECT t.id, t.block_kind
+          FROM tasks t
+         WHERE t.status='blocked'
+           AND NOT EXISTS(
+               SELECT 1 FROM work_blocks b
+                WHERE b.task_id=t.id AND b.resolved_at IS NULL
+           )
+         ORDER BY t.id
+        """
+    ):
+        add(
+            "missing_block_contract", "error",
+            "Blocked task has no active operational unblock contract.",
+            task_id=row["id"], ref=row["block_kind"],
+        )
 
     for row in conn.execute(
         """

@@ -96,8 +96,14 @@ def test_legacy_adoption_is_idempotent_and_covers_tasks_without_keys(conn):
 
     first = ledger.adopt_legacy_tasks(conn)
     second = ledger.adopt_legacy_tasks(conn)
-    assert first == {"tasks_seen": 2, "specs_created": 2, "sources_created": 1}
-    assert second == {"tasks_seen": 2, "specs_created": 0, "sources_created": 0}
+    assert first == {
+        "tasks_seen": 2, "specs_created": 2, "sources_created": 1,
+        "blocks_created": 0, "decisions_created": 0,
+    }
+    assert second == {
+        "tasks_seen": 2, "specs_created": 0, "sources_created": 0,
+        "blocks_created": 0, "decisions_created": 0,
+    }
     assert conn.execute("SELECT COUNT(*) FROM work_specs").fetchone()[0] == 2
     source = conn.execute(
         "SELECT source, event_id, task_id FROM work_source_events"
@@ -117,6 +123,30 @@ def test_audit_exposes_tasks_that_bypass_canonical_creation(conn):
     assert {item["kind"] for item in report["findings"]} == {
         "missing_work_spec", "idempotency_without_source",
     }
+
+
+def test_legacy_adoption_migrates_typed_blocks_and_human_questions(conn):
+    with kbc.write_txn(conn):
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, created_at, workspace_kind, block_kind) "
+            "VALUES ('waiting', 'Choose the route', 'blocked', 0, ?, 'scratch', 'needs_input')",
+            (int(time.time()),),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+            (
+                "waiting", "blocked", json.dumps({"reason": "Which route should we use?"}),
+                int(time.time()),
+            ),
+        )
+
+    result = ledger.adopt_legacy_tasks(conn)
+    assert result["blocks_created"] == 1
+    assert result["decisions_created"] == 1
+    snapshot = ledger.task_ledger_snapshot(conn, "waiting")
+    assert snapshot["blocks"][0]["unblock_condition"] == "Which route should we use?"
+    assert snapshot["decisions"][0]["question"] == "Which route should we use?"
+    assert ledger.ledger_audit(conn)["ok"] is True
 
 
 def test_source_event_conflict_is_visible(conn):
@@ -285,6 +315,27 @@ def test_block_contract_must_resolve_before_completion(conn):
     assert kb.complete_task(conn, task_id, result="Approval received and applied")
     resolved = ledger.task_ledger_snapshot(conn, task_id)["blocks"][0]
     assert resolved["resolved_at"] is not None
+
+
+def test_needs_input_block_opens_one_decision_and_unblock_records_its_answer(conn):
+    task_id = kb.create_task(conn, title="Choose and continue")
+    assert kb.block_task(
+        conn, task_id, kind="needs_input", reason="Which option should be used?",
+    )
+    decision = conn.execute(
+        "SELECT id, status, question FROM work_decisions WHERE task_id=?", (task_id,),
+    ).fetchone()
+    assert decision["status"] == "open"
+    assert decision["question"] == "Which option should be used?"
+
+    assert kb.unblock_task(
+        conn, task_id, answer="Use option B", actor="Aiman",
+    )
+    answered = conn.execute(
+        "SELECT status, answer, action_ref FROM work_decisions WHERE id=?", (decision["id"],),
+    ).fetchone()
+    assert tuple(answered) == ("answered", "Use option B", f"task:{task_id}")
+    assert kb.complete_task(conn, task_id, result="Option B applied and verified")
 
 
 def test_required_acceptance_needs_independent_evidence(conn, tmp_path):

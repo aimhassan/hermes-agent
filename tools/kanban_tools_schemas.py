@@ -543,6 +543,11 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     ),
     {
         "task_id": _prop("string", "Blocked task id to move to ready or parent-gated todo."),
+        "answer": _prop("string", (
+            "The answer or resolved fact that ended a needs_input block. It is recorded "
+            "once in the decision ledger and resumes this task as the resulting action."
+        )),
+        "actor": _prop("string", "Who supplied the answer. Defaults to orchestrator."),
     },
     ["task_id"],
 )

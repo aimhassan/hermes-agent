@@ -3606,7 +3606,13 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    answer: Optional[str] = None,
+    actor: str = "operator",
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
@@ -3639,15 +3645,28 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        from hermes_cli.kanban_ledger import resolve_active_block
+        from hermes_cli.kanban_ledger import answer_open_block_decisions, resolve_active_block
         block_resolved = resolve_active_block(
-            conn, task_id, actor="operator", resolution=f"unblocked to {new_status}",
+            conn, task_id, actor=actor, resolution=f"unblocked to {new_status}",
+        )
+        decisions_answered = (
+            answer_open_block_decisions(
+                conn, task_id, answer=answer, actor=actor,
+            )
+            if answer is not None else 0
         )
         _append_event(
             conn, task_id, "unblocked",
             (
-                {"status": new_status, "resume_status": resume_status, "block_resolved": block_resolved}
-                if new_status != "ready" or resume_status != "ready" or block_resolved
+                {
+                    "status": new_status, "resume_status": resume_status,
+                    "block_resolved": block_resolved,
+                    "decisions_answered": decisions_answered,
+                }
+                if (
+                    new_status != "ready" or resume_status != "ready"
+                    or block_resolved or decisions_answered
+                )
                 else None
             ),
         )
